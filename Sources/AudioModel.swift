@@ -1,5 +1,13 @@
 import AVFoundation
 import Combine
+import UIKit
+
+struct Track: Identifiable, Hashable {
+    let url: URL
+    let rel: String
+    var id: String { url.path }
+    var name: String { url.lastPathComponent }
+}
 
 struct Check: Identifiable {
     let id = UUID()
@@ -21,6 +29,8 @@ final class AudioModel: ObservableObject {
     @Published var levelL: Float = -90
     @Published var levelR: Float = -90
     @Published var log: [String] = []
+    @Published var tracks: [Track] = []
+    @Published var currentURL: URL?
     @Published var gainDB: Float = 0 {
         didSet {
             eq.globalGain = gainDB
@@ -61,8 +71,65 @@ final class AudioModel: ObservableObject {
             self?.addLog("Interruption \(t == 1 ? "began" : "ended")")
             if t == 1 { self?.player.pause(); self?.isPlaying = false }
         }
+        nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshLibrary()
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
+        refreshLibrary()
     }
+
+    // MARK: Library (Documents folder, visible in Files > On My iPhone > Audio Test)
+
+    private var docsURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+
+    func refreshLibrary() {
+        let fm = FileManager.default
+        let docs = docsURL
+        try? fm.createDirectory(at: docs.appendingPathComponent("Music"), withIntermediateDirectories: true)
+        let exts: Set<String> = ["flac", "m4a", "alac", "wav", "aiff", "aif", "mp3", "caf", "aac"]
+        DispatchQueue.global(qos: .userInitiated).async {
+            var found: [Track] = []
+            let base = docs.resolvingSymlinksInPath().path
+            if let en = fm.enumerator(at: docs, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+                for case let u as URL in en where exts.contains(u.pathExtension.lowercased()) {
+                    var rel = u.resolvingSymlinksInPath().path
+                    if rel.hasPrefix(base + "/") { rel = String(rel.dropFirst(base.count + 1)) }
+                    found.append(Track(url: u, rel: rel))
+                }
+            }
+            found.sort { $0.rel.localizedStandardCompare($1.rel) == .orderedAscending }
+            DispatchQueue.main.async {
+                self.tracks = found
+                self.addLog("Library refreshed: \(found.count) track(s)")
+            }
+        }
+    }
+
+    func importFiles(_ urls: [URL]) {
+        let fm = FileManager.default
+        let dir = docsURL.appendingPathComponent("Music")
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        var last: URL?
+        for u in urls {
+            let ok = u.startAccessingSecurityScopedResource()
+            defer { if ok { u.stopAccessingSecurityScopedResource() } }
+            let dest = dir.appendingPathComponent(u.lastPathComponent)
+            do {
+                if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+                try fm.copyItem(at: u, to: dest)
+                last = dest
+                addLog("Imported \(u.lastPathComponent)")
+            } catch {
+                addLog("Import failed: \(error.localizedDescription)")
+            }
+        }
+        refreshLibrary()
+        if let l = last { load(l) }
+    }
+
+    func play() { if !isPlaying { togglePlay() } }
 
     // MARK: Load / decode
 
@@ -80,6 +147,7 @@ final class AudioModel: ObservableObject {
             codecText = fourCC(asbd.mFormatID)
             bitsText = detectBits(url: url, asbd: asbd)
             fileName = url.lastPathComponent
+            currentURL = url
             duration = Double(f.length) / pf.sampleRate
             position = 0
             fileInfo = "\(codecText) · \(Int(ff.sampleRate)) Hz · \(bitsText) bit · \(ff.channelCount) ch · \(f.length) frames"

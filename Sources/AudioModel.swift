@@ -9,16 +9,17 @@ struct Track: Identifiable, Hashable {
     var name: String { url.lastPathComponent }
 }
 
-struct Check: Identifiable {
-    let id = UUID()
+struct Check: Identifiable, Equatable {
     let text: String
     let ok: Bool
+    var id: String { text }
 }
 
 final class AudioModel: ObservableObject {
     @Published var fileName = "No file loaded"
     @Published var fileInfo = "-"
     @Published var decodeInfo = "-"
+    @Published var decodeRows: [InfoRow] = []
     @Published var pathText = "-"
     @Published var sessionInfo = "-"
     @Published var routeInfo = "-"
@@ -41,7 +42,7 @@ final class AudioModel: ObservableObject {
 
     var isSeeking = false
 
-    private let engine = AVAudioEngine()
+    let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private let eq = AVAudioUnitEQ(numberOfBands: 1)
     private var file: AVAudioFile?
@@ -51,6 +52,11 @@ final class AudioModel: ObservableObject {
     private var generation = 0
     private var scopedURL: URL?
     private var timer: Timer?
+    private var tickCount = 0
+    private var fileBytes: Int64 = 0
+    private var peakL: Float = -90
+    private var peakR: Float = -90
+    private var clips = 0
 
     init() {
         engine.attach(player)
@@ -147,6 +153,8 @@ final class AudioModel: ObservableObject {
             codecText = fourCC(asbd.mFormatID)
             bitsText = detectBits(url: url, asbd: asbd)
             fileName = url.lastPathComponent
+            fileBytes = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.int64Value ?? 0
+            peakL = -90; peakR = -90; clips = 0
             currentURL = url
             duration = Double(f.length) / pf.sampleRate
             position = 0
@@ -157,6 +165,7 @@ final class AudioModel: ObservableObject {
             installMeter()
             prepare(from: 0)
             refreshInfo()
+            refreshDecode()
             addLog("Loaded \(url.lastPathComponent)")
         } catch {
             addLog("Load failed: \(error.localizedDescription)")
@@ -247,6 +256,11 @@ final class AudioModel: ObservableObject {
     }
 
     private func tick() {
+        tickCount += 1
+        if tickCount % 3 == 0 {      // ~0.3 s: everything on screen stays live
+            refreshInfo()
+            refreshDecode()
+        }
         guard isPlaying, !isSeeking, let f = file,
               let nt = player.lastRenderTime,
               let pt = player.playerTime(forNodeTime: nt) else { return }
@@ -272,8 +286,12 @@ final class AudioModel: ObservableObject {
             let r = buf.format.channelCount > 1 ? peak(1) : l
             func db(_ v: Float) -> Float { v < 0.00003 ? -90 : 20 * log10(v) }
             DispatchQueue.main.async {
-                self?.levelL = db(l)
-                self?.levelR = db(r)
+                guard let self = self else { return }
+                self.levelL = db(l)
+                self.levelR = db(r)
+                self.peakL = max(self.peakL, db(l))
+                self.peakR = max(self.peakR, db(r))
+                if l >= 0.9999 || r >= 0.9999 { self.clips += 1 }
             }
         }
     }
@@ -283,21 +301,97 @@ final class AudioModel: ObservableObject {
     func refreshInfo() {
         let s = AVAudioSession.sharedInstance()
         let outs = s.currentRoute.outputs
-        routeInfo = outs.isEmpty ? "No output" : outs.map { "\($0.portName) (\($0.portType.rawValue))" }.joined(separator: ", ")
+        let newRoute = outs.isEmpty ? "No output" : outs.map { "\($0.portName) (\($0.portType.rawValue))" }.joined(separator: ", ")
+        if routeInfo != newRoute { routeInfo = newRoute }
         let hw = engine.outputNode.outputFormat(forBus: 0)
-        sessionInfo = String(format: "Session %.0f Hz (preferred %.0f) · IO buffer %.1f ms · %d out ch · engine out %.0f Hz %d ch",
-                             s.sampleRate, s.preferredSampleRate, s.ioBufferDuration * 1000,
-                             s.outputNumberOfChannels, hw.sampleRate, hw.channelCount)
-        guard let f = file else { pathText = "-"; checks = []; return }
+        let newSession = String(format: "Session %.0f Hz (preferred %.0f) · IO buffer %.1f ms · %d out ch · engine out %.0f Hz %d ch",
+                                s.sampleRate, s.preferredSampleRate, s.ioBufferDuration * 1000,
+                                s.outputNumberOfChannels, hw.sampleRate, hw.channelCount)
+        if sessionInfo != newSession { sessionInfo = newSession }
+        guard let f = file else {
+            if pathText != "-" { pathText = "-" }
+            if !checks.isEmpty { checks = [] }
+            return
+        }
         let fileRate = f.fileFormat.sampleRate
         let rateOK = abs(s.sampleRate - fileRate) < 1 && abs(hw.sampleRate - fileRate) < 1
         let gainStr = gainDB == 0 ? "bypass" : String(format: "%+.1f dB", gainDB)
-        pathText = "\(codecText) \(Int(fileRate)) Hz/\(bitsText) → AVAudioFile decode → Float32 → Player → Gain (\(gainStr)) → Mixer → Output \(Int(hw.sampleRate)) Hz → \(routeInfo)"
-        checks = [
+        let newPath = "\(codecText) \(Int(fileRate)) Hz/\(bitsText) → AVAudioFile decode → Float32 → Player → Gain (\(gainStr)) → Mixer → Output \(Int(hw.sampleRate)) Hz → \(routeInfo)"
+        if pathText != newPath { pathText = newPath }
+        let newChecks = [
             Check(text: "Output rate = file rate (no resampling)", ok: rateOK),
             Check(text: "Gain/EQ bypassed", ok: gainDB == 0),
             Check(text: "External digital route (USB/Lightning DAC)", ok: outs.contains { $0.portType == .usbAudio }),
         ]
+        if checks != newChecks { checks = newChecks }
+    }
+
+    // MARK: Live decode readout (refreshes ~3x/sec, also while idle)
+
+    func refreshDecode() {
+        let s = AVAudioSession.sharedInstance()
+        let hw = engine.outputNode.outputFormat(forBus: 0)
+        let outs = s.currentRoute.outputs
+        let usb = outs.contains { $0.portType == .usbAudio }
+        var rows: [InfoRow] = []
+
+        guard let f = file else {
+            rows.append(InfoRow(key: "Decoder", value: "idle · no file loaded"))
+            rows.append(InfoRow(key: "Hardware output",
+                                value: String(format: "%.0f Hz · %d ch · session %.0f Hz", hw.sampleRate, Int(hw.channelCount), s.sampleRate)))
+            if decodeRows != rows { decodeRows = rows }
+            return
+        }
+
+        let ff = f.fileFormat, pf = f.processingFormat
+        let fileRate = ff.sampleRate
+        let rateOK = abs(s.sampleRate - fileRate) < 1 && abs(hw.sampleRate - fileRate) < 1
+        let total = f.length
+        let cur = min(max(Int64(position * pf.sampleRate), 0), Int64(total))
+        let pct = total > 0 ? Double(cur) / Double(total) * 100 : 0
+        let bitsNum = Int(bitsText) ?? 0
+
+        // Bit-perfect verdict (as far as iOS exposes it)
+        var why: [String] = []
+        if !rateOK { why.append("resampled \(Int(fileRate))→\(Int(hw.sampleRate)) Hz") }
+        if gainDB != 0 { why.append("gain active") }
+        if engine.mainMixerNode.outputVolume != 1 { why.append("mixer volume ≠ 1") }
+        if !usb { why.append("not a USB DAC route") }
+        if bitsNum > 24 { why.append("\(bitsNum)-bit source > Float32 24-bit precision") }
+        if Int(hw.channelCount) != Int(pf.channelCount) { why.append("channel count remapped") }
+        rows.append(InfoRow(key: "Bit-perfect path",
+                            value: why.isEmpty ? "YES" : "NO · " + why.joined(separator: " · ")))
+
+        rows.append(InfoRow(key: "Decoder state",
+                            value: "\(isPlaying ? "decoding / playing" : "paused / stopped") · engine \(engine.isRunning ? "running" : "stopped")"))
+        rows.append(InfoRow(key: "Codec / container",
+                            value: "\(codecText) · .\(f.url.pathExtension.lowercased())"))
+        rows.append(InfoRow(key: "Source", value: "\(Int(fileRate)) Hz · \(bitsText) bit · \(ff.channelCount) ch"))
+        if fileBytes > 0 && duration > 0 {
+            rows.append(InfoRow(key: "Average bitrate",
+                                value: String(format: "%.0f kbps · %.1f MB", Double(fileBytes) * 8 / duration / 1000, Double(fileBytes) / 1_048_576)))
+        }
+        let pcmName = pf.commonFormat == .pcmFormatFloat32 ? "Float32" : "PCM"
+        rows.append(InfoRow(key: "Decoded to",
+                            value: "\(pcmName) · \(Int(pf.sampleRate)) Hz · \(pf.channelCount) ch · \(pf.isInterleaved ? "interleaved" : "planar")"))
+        rows.append(InfoRow(key: "Rate chain",
+                            value: String(format: "file %.0f → session %.0f → engine out %.0f Hz · %@",
+                                          fileRate, s.sampleRate, hw.sampleRate, rateOK ? "no resampling" : "RESAMPLING")))
+        rows.append(InfoRow(key: "Frames decoded / total",
+                            value: String(format: "%lld / %lld  (%.1f%%)", cur, Int64(total), pct)))
+        rows.append(InfoRow(key: "Time", value: String(format: "%.2f s / %.2f s · %.2f s left", position, duration, max(duration - position, 0))))
+        if let nt = player.lastRenderTime {
+            rows.append(InfoRow(key: "Player render clock", value: "\(nt.sampleTime) frames"))
+        }
+        rows.append(InfoRow(key: "Gain stage", value: gainDB == 0 ? "bypass (0 dB)" : String(format: "%+.1f dB", gainDB)))
+        rows.append(InfoRow(key: "Level (dBFS)",
+                            value: String(format: "L %.1f · R %.1f  |  peak L %.1f · R %.1f", levelL, levelR, peakL, peakR)))
+        rows.append(InfoRow(key: "Clipped buffers", value: "\(clips)"))
+        rows.append(InfoRow(key: "DAC sink",
+                            value: String(format: "%@ · %.0f Hz · IO %.1f ms · latency %.1f ms",
+                                          outs.first?.portName ?? "none", s.sampleRate, s.ioBufferDuration * 1000, s.outputLatency * 1000)))
+
+        if decodeRows != rows { decodeRows = rows }
     }
 
     // MARK: Helpers

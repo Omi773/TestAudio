@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var m = AudioModel()
+    @StateObject private var dac = DACMonitor()
     @State private var picking = false
 
     private var types: [UTType] {
@@ -35,8 +36,8 @@ struct ContentView: View {
                         }
                     }
                 }
-                Section("Decode") {
-                    Text(m.decodeInfo).font(.footnote.monospaced())
+                Section("Decode · live") {
+                    ForEach(m.decodeRows) { rowView($0) }
                 }
                 Section("Transport") {
                     Slider(value: $m.position, in: 0...max(m.duration, 1)) { editing in
@@ -70,7 +71,38 @@ struct ContentView: View {
                             .foregroundStyle(c.ok ? .green : .secondary)
                             .font(.footnote)
                     }
-                    Button("Refresh") { m.refreshInfo() }
+                    Button("Refresh now") { m.refreshInfo(); m.refreshDecode() }
+                }
+                Section("DAC · live") {
+                    HStack(spacing: 8) {
+                        Circle().fill(dac.connected ? Color.green : Color.red).frame(width: 10, height: 10)
+                        Text(dac.headline).font(.headline)
+                    }
+                    if let since = dac.connectedSince {
+                        HStack {
+                            Text("Seen connected for").font(.caption2).foregroundStyle(.secondary)
+                            Text(since, style: .timer).font(.footnote.monospacedDigit())
+                        }
+                    }
+                    ForEach(dac.status) { rowView($0) }
+                }
+                Section("DAC · link & format") {
+                    ForEach(dac.link) { rowView($0) }
+                }
+                Section("Audio session") {
+                    ForEach(dac.system) { rowView($0) }
+                }
+                Section("DAC · supported rates") {
+                    Text("Stop playback first. Requests each rate and shows what iOS grants.").font(.caption2)
+                    Button(dac.probing ? "Probing…" : "Probe rates") { dac.probeRates() }
+                        .buttonStyle(.bordered)
+                        .disabled(dac.probing || m.isPlaying)
+                    ForEach(dac.rates) { rowView($0) }
+                }
+                Section("DAC · events") {
+                    ForEach(Array(dac.events.enumerated()), id: \.offset) { _, line in
+                        Text(line).font(.caption2.monospaced())
+                    }
                 }
                 Section("Log") {
                     ForEach(Array(m.log.enumerated()), id: \.offset) { _, line in
@@ -79,12 +111,20 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Audio Test")
+            .onAppear { dac.attach(engine: m.engine) }
             .fileImporter(isPresented: $picking, allowedContentTypes: types, allowsMultipleSelection: true) { result in
                 switch result {
                 case .success(let urls): m.importFiles(urls)
                 case .failure(let e): m.addLog("Picker: \(e.localizedDescription)")
                 }
             }
+        }
+    }
+
+    private func rowView(_ r: InfoRow) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(r.key).font(.caption2).foregroundStyle(.secondary)
+            Text(r.value).font(.footnote.monospaced())
         }
     }
 

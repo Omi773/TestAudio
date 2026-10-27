@@ -6,7 +6,7 @@ struct ContentView: View {
     @State private var picking = false
 
     private var types: [UTType] {
-        [.audio] + ["flac", "alac", "m4a", "wav", "aiff"].compactMap { UTType(filenameExtension: $0) }
+        [.item]
     }
 
     var body: some View {
@@ -15,7 +15,25 @@ struct ContentView: View {
                 Section("File") {
                     Text(m.fileName).font(.headline)
                     Text(m.fileInfo).font(.footnote.monospaced())
-                    Button("Pick audio file") { picking = true }
+                }
+                Section("Library") {
+                    Text("Files app → On My iPhone → Audio Test → Music").font(.caption2)
+                    HStack(spacing: 16) {
+                        Button("Refresh library") { m.refreshLibrary() }
+                        Button("Import file…") { picking = true }
+                    }.buttonStyle(.bordered)
+                    Text("\(m.tracks.count) track(s)").font(.footnote)
+                    ForEach(m.tracks) { t in
+                        Button {
+                            m.load(t.url)
+                            m.play()
+                        } label: {
+                            HStack {
+                                Image(systemName: m.currentURL == t.url ? "speaker.wave.2.fill" : "music.note")
+                                Text(t.rel).font(.footnote).multilineTextAlignment(.leading)
+                            }
+                        }
+                    }
                 }
                 Section("Decode") {
                     Text(m.decodeInfo).font(.footnote.monospaced())
@@ -61,9 +79,9 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Audio Test")
-            .fileImporter(isPresented: $picking, allowedContentTypes: types) { result in
+            .fileImporter(isPresented: $picking, allowedContentTypes: types, allowsMultipleSelection: true) { result in
                 switch result {
-                case .success(let url): m.load(url)
+                case .success(let urls): m.importFiles(urls)
                 case .failure(let e): m.addLog("Picker: \(e.localizedDescription)")
                 }
             }
